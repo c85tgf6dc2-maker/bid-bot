@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 
 def _authorized():
-    expected = os.environ.get("DATA_GO_KR_SERVICE_KEY")
+    expected = os.environ.get("CRON_SECRET")
     supplied = request.headers.get("Authorization", "")
     return bool(expected) and supplied == f"Bearer {expected}"
 
