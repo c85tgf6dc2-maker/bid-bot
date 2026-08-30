@@ -4,6 +4,7 @@ from flask import Flask, jsonify, request
 
 from bid_bot import main
 
+# Deployment marker: refresh Vercel environment variables.
 app = Flask(__name__)
 
 
