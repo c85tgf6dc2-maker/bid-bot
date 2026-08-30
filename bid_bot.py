@@ -67,13 +67,18 @@ def api_get(path, params):
                 )
 
             data = response.json()
-            header = data.get("response", {}).get("header", {})
-            if header.get("resultCode") != "00":
+            response_obj = data.get("response", {}) or {}
+            header = response_obj.get("header", {}) or {}
+            result_code = header.get("resultCode")
+
+            # 일부 나라장터 세부 API는 정상 응답이어도 header/resultCode가 없다.
+            # resultCode가 실제로 존재할 때만 실패 여부를 판정한다.
+            if result_code is not None and str(result_code) not in ("00", "0"):
                 raise RuntimeError(
-                    f"G2B API error: {header.get('resultCode')} {header.get('resultMsg')}"
+                    f"G2B API error: {result_code} {header.get('resultMsg')}"
                 )
 
-            body = data.get("response", {}).get("body", {})
+            body = response_obj.get("body", {}) or {}
             items = body.get("items", []) or []
             if isinstance(items, dict):
                 items = [items]
