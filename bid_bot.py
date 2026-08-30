@@ -13,9 +13,14 @@ SERVICE_KEY = unquote(RAW_SERVICE_KEY) if RAW_SERVICE_KEY else None
 
 KST = timezone(timedelta(hours=9))
 TARGET_REGION = "광양"
-MAX_RETRIES = 5
-CONNECT_TIMEOUT = 60
-READ_TIMEOUT = 60
+LOOKBACK_HOURS = 13
+RUN_BUDGET_SECONDS = 240
+MAX_RETRIES = 2
+CONNECT_TIMEOUT = 8
+READ_TIMEOUT = 20
+RETRY_DELAY_SECONDS = 3
+
+TARGET_KEYWORDS = ["지반조성", "포장", "도장", "습식", "방수", "석공"]
 
 A_FIELDS = [
     "sftyMngcst",
@@ -71,8 +76,6 @@ def api_get(path, params):
             header = response_obj.get("header", {}) or {}
             result_code = header.get("resultCode")
 
-            # 일부 나라장터 세부 API는 정상 응답이어도 header/resultCode가 없다.
-            # resultCode가 실제로 존재할 때만 실패 여부를 판정한다.
             if result_code is not None and str(result_code) not in ("00", "0"):
                 raise RuntimeError(
                     f"G2B API error: {result_code} {header.get('resultMsg')}"
@@ -88,16 +91,18 @@ def api_get(path, params):
             last_error = exc
             if attempt >= MAX_RETRIES:
                 break
-            wait_seconds = attempt * 15
+            wait_seconds = RETRY_DELAY_SECONDS * attempt
             print(f"G2B 연결 실패: {exc}; {wait_seconds}초 후 재시도")
             time.sleep(wait_seconds)
 
-    raise RuntimeError(f"G2B API connection failed after {MAX_RETRIES} attempts: {last_error}")
+    raise RuntimeError(
+        f"G2B API connection failed after {MAX_RETRIES} attempts: {last_error}"
+    )
 
 
 def get_recent_construction_bids():
     now = datetime.now(KST)
-    begin = now - timedelta(days=3)
+    begin = now - timedelta(hours=LOOKBACK_HOURS)
     common = {
         "inqryDiv": 1,
         "inqryBgnDt": begin.strftime("%Y%m%d%H%M"),
@@ -144,6 +149,17 @@ def is_target_industry(text):
     paving = "지반조성" in text and "포장" in text
     coating_group = any(word in text for word in ["도장", "습식", "방수", "석공"])
     return paving or coating_group
+
+
+def main_industry_state(bid):
+    text = all_text(bid.get("mainCnsttyNm", ""))
+    if not text.strip():
+        return "unknown"
+    if is_target_industry(text):
+        return "target"
+    if any(keyword in text for keyword in TARGET_KEYWORDS):
+        return "possible"
+    return "other"
 
 
 def calculate_a_value(a_rows, basis_rows):
@@ -217,28 +233,56 @@ def main():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL secret is missing")
 
+    started = time.monotonic()
     bids = get_recent_construction_bids()
-    print(f"최근 3일 공사 공고: {len(bids)}건")
+    print(f"최근 {LOOKBACK_HOURS}시간 공사 공고: {len(bids)}건")
 
-    conn = psycopg2.connect(DATABASE_URL, connect_timeout=30)
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=15)
     saved = 0
+    candidates = 0
+    timed_out_early = False
 
     try:
         for bid in bids:
+            if time.monotonic() - started >= RUN_BUDGET_SECONDS:
+                print("Vercel 실행 시간 예산에 가까워져 현재 실행을 종료합니다.")
+                timed_out_early = True
+                break
+
             notice_no = bid.get("bidNtceNo")
             if not notice_no:
                 continue
 
+            industry_state = main_industry_state(bid)
+            if industry_state == "other":
+                continue
+
+            candidates += 1
+
             try:
-                license_rows = get_by_notice("/getBidPblancListInfoLicenseLimit", notice_no)
-                region_rows = get_by_notice("/getBidPblancListInfoPrtcptPsblRgn", notice_no)
-                field_rows = get_by_notice("/getBidPblancListEvaluationIndstrytyMfrcInfo", notice_no)
+                region_rows = get_by_notice(
+                    "/getBidPblancListInfoPrtcptPsblRgn", notice_no
+                )
+
+                license_rows = []
+                field_rows = []
+                if industry_state != "target":
+                    license_rows = get_by_notice(
+                        "/getBidPblancListInfoLicenseLimit", notice_no
+                    )
+                    field_rows = get_by_notice(
+                        "/getBidPblancListEvaluationIndstrytyMfrcInfo", notice_no
+                    )
 
                 if not classify_target(bid, license_rows, region_rows, field_rows):
                     continue
 
-                basis_rows = get_by_notice("/getBidPblancListInfoCnstwkBsisAmount", notice_no, rows=10)
-                a_rows = get_by_notice("/getBidPblancListBidPrceCalclAInfo", notice_no, rows=10)
+                basis_rows = get_by_notice(
+                    "/getBidPblancListInfoCnstwkBsisAmount", notice_no, rows=10
+                )
+                a_rows = get_by_notice(
+                    "/getBidPblancListBidPrceCalclAInfo", notice_no, rows=10
+                )
                 a_value = calculate_a_value(a_rows, basis_rows)
 
                 save_bid(conn, bid, basis_rows, a_value)
@@ -262,7 +306,16 @@ def main():
     finally:
         conn.close()
 
-    print(f"완료: 대상 공고 {saved}건 저장")
+    elapsed = round(time.monotonic() - started, 1)
+    result = {
+        "scanned": len(bids),
+        "candidates": candidates,
+        "saved": saved,
+        "elapsed_seconds": elapsed,
+        "stopped_for_time_budget": timed_out_early,
+    }
+    print(f"완료: {result}")
+    return result
 
 
 if __name__ == "__main__":
