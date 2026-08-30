@@ -1,0 +1,30 @@
+name: Bid Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 06:00, 10:00, 14:00, 18:00 KST
+    - cron: "0 1,5,9,21 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bid collector
+        env:
+          DATA_GO_KR_SERVICE_KEY: ${{ secrets.DATA_GO_KR_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python bid_bot.py
