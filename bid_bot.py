@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
@@ -8,22 +9,22 @@ import requests
 BASE_URL = "https://apis.data.go.kr/1230000/ad/BidPublicInfoService"
 RAW_SERVICE_KEY = os.environ.get("DATA_GO_KR_SERVICE_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-
-# 공공데이터포털의 Encoding 키(%2F, %3D 등)를 Secret에 넣어도
-# requests가 다시 인코딩하지 않도록 먼저 Decoding 형태로 변환한다.
 SERVICE_KEY = unquote(RAW_SERVICE_KEY) if RAW_SERVICE_KEY else None
 
 KST = timezone(timedelta(hours=9))
 TARGET_REGION = "광양"
+MAX_RETRIES = 5
+CONNECT_TIMEOUT = 60
+READ_TIMEOUT = 60
 
 A_FIELDS = [
-    "sftyMngcst",              # 산업안전보건관리비
-    "sftyChckMngcst",          # 안전관리비
-    "rtrfundNon",              # 퇴직공제부금비
-    "mrfnHealthInsrprm",       # 국민건강보험료
-    "npnInsrprm",              # 국민연금보험료
-    "odsnLngtrmrcprInsrprm",   # 노인장기요양보험료
-    "qltyMngcst",              # 품질관리비
+    "sftyMngcst",
+    "sftyChckMngcst",
+    "rtrfundNon",
+    "mrfnHealthInsrprm",
+    "npnInsrprm",
+    "odsnLngtrmrcprInsrprm",
+    "qltyMngcst",
 ]
 
 
@@ -41,36 +42,57 @@ def api_get(path, params):
         raise RuntimeError("DATA_GO_KR_SERVICE_KEY secret is missing")
 
     query = dict(params)
-    query.update({
-        "serviceKey": SERVICE_KEY,
-        "type": "json",
-    })
+    query.update({"serviceKey": SERVICE_KEY, "type": "json"})
+    url = BASE_URL + path
+    last_error = None
 
-    response = requests.get(BASE_URL + path, params=query, timeout=40)
-    if not response.ok:
-        raise RuntimeError(
-            f"G2B HTTP {response.status_code}: {response.text[:500]}"
-        )
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"G2B 요청 {path} 시도 {attempt}/{MAX_RETRIES}")
+            response = requests.get(
+                url,
+                params=query,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                headers={"User-Agent": "Mozilla/5.0 bid-bot/1.0"},
+            )
 
-    data = response.json()
+            if response.status_code in (429, 500, 502, 503, 504):
+                raise requests.RequestException(
+                    f"temporary HTTP {response.status_code}"
+                )
 
-    header = data.get("response", {}).get("header", {})
-    if header.get("resultCode") != "00":
-        raise RuntimeError(
-            f"G2B API error: {header.get('resultCode')} {header.get('resultMsg')}"
-        )
+            if not response.ok:
+                raise RuntimeError(
+                    f"G2B HTTP {response.status_code}: {response.text[:500]}"
+                )
 
-    body = data.get("response", {}).get("body", {})
-    items = body.get("items", []) or []
-    if isinstance(items, dict):
-        items = [items]
-    return items, int(body.get("totalCount", len(items)) or 0)
+            data = response.json()
+            header = data.get("response", {}).get("header", {})
+            if header.get("resultCode") != "00":
+                raise RuntimeError(
+                    f"G2B API error: {header.get('resultCode')} {header.get('resultMsg')}"
+                )
+
+            body = data.get("response", {}).get("body", {})
+            items = body.get("items", []) or []
+            if isinstance(items, dict):
+                items = [items]
+            return items, int(body.get("totalCount", len(items)) or 0)
+
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException) as exc:
+            last_error = exc
+            if attempt >= MAX_RETRIES:
+                break
+            wait_seconds = attempt * 15
+            print(f"G2B 연결 실패: {exc}; {wait_seconds}초 후 재시도")
+            time.sleep(wait_seconds)
+
+    raise RuntimeError(f"G2B API connection failed after {MAX_RETRIES} attempts: {last_error}")
 
 
 def get_recent_construction_bids():
     now = datetime.now(KST)
     begin = now - timedelta(hours=6)
-
     common = {
         "inqryDiv": 1,
         "inqryBgnDt": begin.strftime("%Y%m%d%H%M"),
@@ -81,8 +103,8 @@ def get_recent_construction_bids():
 
     first, total = api_get("/getBidPblancListInfoCnstwk", common)
     rows = list(first)
-
     page = 2
+
     while len(rows) < total:
         params = dict(common)
         params["pageNo"] = page
@@ -96,13 +118,15 @@ def get_recent_construction_bids():
 
 
 def get_by_notice(path, notice_no, rows=100):
-    params = {
-        "pageNo": 1,
-        "numOfRows": rows,
-        "inqryDiv": 2,
-        "bidNtceNo": notice_no,
-    }
-    result, _ = api_get(path, params)
+    result, _ = api_get(
+        path,
+        {
+            "pageNo": 1,
+            "numOfRows": rows,
+            "inqryDiv": 2,
+            "bidNtceNo": notice_no,
+        },
+    )
     return result
 
 
@@ -121,7 +145,6 @@ def calculate_a_value(a_rows, basis_rows):
     source = a_rows[0] if a_rows else (basis_rows[0] if basis_rows else {})
     if not source:
         return None
-
     total = sum(as_number(source.get(field)) for field in A_FIELDS)
     return total if total > 0 else None
 
@@ -145,7 +168,6 @@ def classify_target(bid, license_rows, region_rows, field_rows):
 
 def save_bid(conn, bid, basis_rows, a_value):
     basis = basis_rows[0] if basis_rows else {}
-
     notice_no = f"{bid.get('bidNtceNo')}-{bid.get('bidNtceOrd', '000')}"
     base_price = basis.get("bssamt") or None
     bid_rate = bid.get("sucsfbidLwltRate") or None
@@ -154,16 +176,8 @@ def save_bid(conn, bid, basis_rows, a_value):
         cur.execute(
             """
             INSERT INTO public.bids (
-                notice_no,
-                agency,
-                project_name,
-                category,
-                region,
-                base_price,
-                a_value,
-                bid_rate,
-                announced_at,
-                source_url
+                notice_no, agency, project_name, category, region,
+                base_price, a_value, bid_rate, announced_at, source_url
             )
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (notice_no)
@@ -201,7 +215,7 @@ def main():
     bids = get_recent_construction_bids()
     print(f"최근 공사 공고: {len(bids)}건")
 
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=30)
     saved = 0
 
     try:
