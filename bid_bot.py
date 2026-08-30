@@ -92,7 +92,7 @@ def api_get(path, params):
 
 def get_recent_construction_bids():
     now = datetime.now(KST)
-    begin = now - timedelta(hours=6)
+    begin = now - timedelta(days=3)
     common = {
         "inqryDiv": 1,
         "inqryBgnDt": begin.strftime("%Y%m%d%H%M"),
@@ -213,7 +213,7 @@ def main():
         raise RuntimeError("DATABASE_URL secret is missing")
 
     bids = get_recent_construction_bids()
-    print(f"최근 공사 공고: {len(bids)}건")
+    print(f"최근 3일 공사 공고: {len(bids)}건")
 
     conn = psycopg2.connect(DATABASE_URL, connect_timeout=30)
     saved = 0
