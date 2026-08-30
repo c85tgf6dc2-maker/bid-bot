@@ -3,7 +3,7 @@
   "regions": ["icn1"],
   "functions": {
     "api/run.py": {
-      "maxDuration": 60
+      "maxDuration": 300
     }
   }
 }
