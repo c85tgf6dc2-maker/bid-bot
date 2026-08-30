@@ -2,6 +2,13 @@ name: Bid Bot
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "bid_bot.py"
+      - "requirements.txt"
+      - ".github/workflows/bid_bot.yml"
   schedule:
     # 06:00, 10:00, 14:00, 18:00 KST
     - cron: "0 1,5,9,21 * * *"
