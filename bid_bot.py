@@ -1,12 +1,17 @@
 import os
 from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote
 
 import psycopg2
 import requests
 
 BASE_URL = "https://apis.data.go.kr/1230000/ad/BidPublicInfoService"
-SERVICE_KEY = os.environ.get("DATA_GO_KR_SERVICE_KEY")
+RAW_SERVICE_KEY = os.environ.get("DATA_GO_KR_SERVICE_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# 공공데이터포털의 Encoding 키(%2F, %3D 등)를 Secret에 넣어도
+# requests가 다시 인코딩하지 않도록 먼저 Decoding 형태로 변환한다.
+SERVICE_KEY = unquote(RAW_SERVICE_KEY) if RAW_SERVICE_KEY else None
 
 KST = timezone(timedelta(hours=9))
 TARGET_REGION = "광양"
@@ -42,12 +47,18 @@ def api_get(path, params):
     })
 
     response = requests.get(BASE_URL + path, params=query, timeout=40)
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"G2B HTTP {response.status_code}: {response.text[:500]}"
+        )
+
     data = response.json()
 
     header = data.get("response", {}).get("header", {})
     if header.get("resultCode") != "00":
-        raise RuntimeError(f"G2B API error: {header.get('resultCode')} {header.get('resultMsg')}")
+        raise RuntimeError(
+            f"G2B API error: {header.get('resultCode')} {header.get('resultMsg')}"
+        )
 
     body = data.get("response", {}).get("body", {})
     items = body.get("items", []) or []
@@ -101,14 +112,12 @@ def all_text(*objects):
 
 def is_target_industry(text):
     text = text.replace("ㆍ", "·")
-
     paving = "지반조성" in text and "포장" in text
     coating_group = any(word in text for word in ["도장", "습식", "방수", "석공"])
     return paving or coating_group
 
 
 def calculate_a_value(a_rows, basis_rows):
-    # A정보 API를 우선 사용하고, 없으면 공사기초금액 응답의 동일 항목으로 보완
     source = a_rows[0] if a_rows else (basis_rows[0] if basis_rows else {})
     if not source:
         return None
